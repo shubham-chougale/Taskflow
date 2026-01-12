@@ -60,3 +60,8 @@ class Task(Base):
     created_by = relationship("User", foreign_keys=[created_by_id])
     assigned_to = relationship("User", foreign_keys=[assigned_to_id])
     team = relationship("Team")
+    attachments = relationship(
+    "Attachment",
+    back_populates="task",
+    cascade="all, delete-orphan"
+)

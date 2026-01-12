@@ -15,6 +15,7 @@ from app.core.exceptions import (
 from app.core.logging import setup_logging, logger
 from app.core.config import settings
 from app.core.openapi import custom_openapi
+from app.api import attachment_routes
 
 
 @asynccontextmanager
@@ -123,3 +124,4 @@ async def health_check():
 # Include routers
 app.include_router(auth_routes.router)
 app.include_router(task_routes.router)
+app.include_router(attachment_routes.router)
