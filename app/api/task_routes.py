@@ -1,21 +1,17 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from uuid import UUID
-from sqlalchemy import or_
 from app.db.session import get_db
-from app.db.models.task import Task
 from app.db.models.user import User
-from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
+from app.schemas.task import TaskCreate, TaskRead, TaskResponse
+from app.schemas.task import TaskUpdate
 from app.core.dependencies import get_current_user, require_role
 from app.db.models.user import UserRole
-from app.schemas.task import TaskResponse
 from app.db.models.task import TaskStatus
-from app.core.dependencies import require_can_create_task
-from datetime import datetime 
+from app.controllers.task_controller import TaskController
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
+
 
 @router.post(
     "",
@@ -26,117 +22,32 @@ router = APIRouter(prefix="/tasks", tags=["Tasks"])
 async def create_task(
     data: TaskCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_can_create_task),
+    current_user: User = Depends(get_current_user),
 ):
-    # Ensure user belongs to a team
-    if current_user.role == UserRole.Manager and not data.assignee_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Manager must assign task to a user"
-        )
-    
-    if current_user.role != UserRole.Admin  and not current_user.team_id:
-        raise HTTPException(
-            status_code=400,
-            detail="User is not assigned to any team"
-        )
+    """Create a new task"""
+    controller = TaskController(db)
+    return await controller.create_task(data, current_user)
 
-    # Validate assignee belongs to same team
-    assignee = None
-    if data.assignee_id:
-        if current_user.role == UserRole.ADMIN:
-            result = await db.execute(
-                select(User).where(User.id == data.assignee_id)
-            )
-        else:
-            result = await db.execute(
-            select(User).where(
-                User.id == data.assignee_id,
-                User.team_id == current_user.team_id,
-            )
-        )    
-        assignee = result.scalar_one_or_none()
-
-        if not assignee:
-            raise HTTPException(
-                status_code=400, detail="Invalid assignee")
-
-    team_id = assignee.team_id if current_user.role == UserRole.ADMIN else current_user.team_id
-    
-    task = Task(
-        title=data.title,
-        description=data.description,
-        assigned_to_id=data.assignee_id,
-        created_by_id=current_user.id,
-        team_id = team_id,
-        status=TaskStatus.OPEN,
-    )
-
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
-
-    return task
 
 @router.get("/", response_model=list[TaskResponse])
 async def list_tasks(
     status: TaskStatus | None = Query(None),
     assignee_id: UUID | None = Query(None),
-    skip: int = 0,
-    limit: int = 10,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = select(Task)
+    """List tasks with role-based filtering and pagination"""
+    controller = TaskController(db)
+    return await controller.list_tasks(
+        current_user=current_user,
+        status=status,
+        assignee_id=assignee_id,
+        skip=skip,
+        limit=limit
+    )
 
-    # Role-based visibility
-    if current_user.role == UserRole.ADMIN:
-        pass
-    elif current_user.role == UserRole.MANAGER:
-        query = query.where(Task.team_id == current_user.team_id)
-    else:  # MEMBER
-        query = query.where(
-                or_(
-                    Task.created_by_id == current_user.id,
-                    Task.assigned_to_id == current_user.id,
-                )
-            )
-
-
-    # Filters
-    if status:
-        query = query.where(Task.status == status)
-
-    if assignee_id:
-        if current_user.role == UserRole.MEMBER:
-            raise HTTPException(
-                status_code=403,
-                detail="Members cannot filter by assignee"
-            )
-        # MANAGER: assignee must belong to same team
-        if current_user.role == UserRole.MANAGER:
-            result = await db.execute(
-                select(User).where(
-                    User.id == assignee_id,
-                    User.team_id == current_user.team_id
-                )
-            )
-            assignee = result.scalar_one_or_none()
-
-            if not assignee:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Assignee not in your team"
-                )
-        query = query.where(Task.assigned_to_id == assignee_id)
-
-    # Pagination
-    query = query.offset(skip).limit(limit)
-
-    result = await db.execute(query)
-    tasks = result.scalars().all()
-
-    return tasks
 
 @router.put(
     "/{task_id}",
@@ -149,53 +60,10 @@ async def update_task(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Task).where(Task.id == task_id)
-    )
-    task = result.scalar_one_or_none()
+    """Update a task"""
+    controller = TaskController(db)
+    return await controller.update_task(task_id, data, current_user)
 
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # MANAGER can update only their team tasks
-    if current_user.role == UserRole.MANAGER:
-        if task.team_id != current_user.team_id:
-            raise HTTPException(status_code=403, detail="Not allowed")
-
-    # Validate assignee
-    if data.assignee_id:
-        if current_user.role == UserRole.ADMIN:
-            result = await db.execute(
-                select(User).where(User.id == data.assignee_id)
-            )
-        else:
-            result = await db.execute(
-                select(User).where(
-                    User.id == data.assignee_id,
-                    User.team_id == current_user.team_id
-                )
-            )
-
-        assignee = result.scalar_one_or_none()
-        if not assignee:
-            raise HTTPException(status_code=400, detail="Invalid assignee")
-
-        task.assigned_to_id = data.assignee_id
-
-    # Update fields
-    if data.title is not None:
-        task.title = data.title
-    if data.description is not None:
-        task.description = data.description
-    if data.status is not None:
-        task.status = data.status
-
-    task.updated_at = datetime.utcnow()
-
-    await db.commit()
-    await db.refresh(task)
-
-    return task
 
 @router.delete(
     "/{task_id}",
@@ -207,20 +75,7 @@ async def delete_task(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Task).where(Task.id == task_id)
-    )
-    task = result.scalar_one_or_none()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # MANAGER can delete only their team tasks
-    if current_user.role == UserRole.MANAGER:
-        if task.team_id != current_user.team_id:
-            raise HTTPException(status_code=403, detail="Not allowed")
-
-    await db.delete(task)
-    await db.commit()
-
+    """Delete a task"""
+    controller = TaskController(db)
+    await controller.delete_task(task_id, current_user)
     return None

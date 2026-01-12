@@ -1,32 +1,41 @@
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from uuid import UUID
+from fastapi import Depends, HTTPException, status, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.db.models.user import User
 from app.schemas.user import UserRole
-from app.core.security import decode_access_token 
-from app.core.config import settings
+from app.core.security import decode_access_token
+from app.core.exceptions import AuthenticationError, AuthorizationError
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+def get_token_from_header(request: Request) -> str:
+    """Extract Bearer token from Authorization header"""
+    authorization = request.headers.get("Authorization")
+    if not authorization:
+        raise AuthenticationError("Authorization header missing")
+    
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise AuthenticationError("Invalid authorization header format. Expected: Bearer <token>")
+    
+    return parts[1]
+
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
+    """Get current authenticated user from JWT token"""
+    token = get_token_from_header(request)
+    
     payload = decode_access_token(token)
     if payload is None:
-        raise credentials_exception
+        raise AuthenticationError("Invalid or expired token")
 
     user_id: str | None = payload.get("sub")
     if user_id is None:
-        raise credentials_exception
+        raise AuthenticationError("Invalid token payload")
 
     result = await db.execute(
         select(User).where(User.id == user_id)
@@ -34,57 +43,48 @@ async def get_current_user(
     user = result.scalar_one_or_none()
 
     if user is None:
-        raise credentials_exception
+        raise AuthenticationError("User not found")
 
     return user 
 
 def require_role(*roles: UserRole):
+    """Dependency to require specific user roles"""
     def checker(current_user: User = Depends(get_current_user)):
         if current_user.role not in roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions",
-            )
+            raise AuthorizationError("Insufficient permissions")
         return current_user
 
     return checker
 
-def require_same_team(resource_team_id: int, user: User):
+def require_same_team(resource_team_id: UUID, user: User):
+    """Check if user has access to team resource"""
     if user.role == UserRole.ADMIN:
         return
 
     if user.team_id != resource_team_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access restricted to your team",
-        )
+        raise AuthorizationError("Access restricted to your team")
     
-def require_task_ownership(task_owner_id: int, user: User):
+def require_task_ownership(task_owner_id: UUID, user: User):
+    """Check if user owns the task"""
     if user.role == UserRole.ADMIN:
         return
 
     if user.id != task_owner_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not own this resource",
-        )
+        raise AuthorizationError("You do not own this resource")
     
 def require_can_create_task(
     current_user: User = Depends(get_current_user),
 ) -> User:
+    """Check if user can create tasks"""
     if current_user.role not in (
         UserRole.ADMIN,
         UserRole.MANAGER,
-        UserRole.MEMBER,
     ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not allowed to create task",
-        )
+        raise AuthorizationError("Not allowed to create task")
 
     if current_user.role != UserRole.ADMIN and not current_user.team_id:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="User must belong to a team",
         )
 
